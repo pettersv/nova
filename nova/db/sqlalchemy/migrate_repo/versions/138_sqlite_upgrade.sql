@@ -51,6 +51,9 @@ BEGIN TRANSACTION;
         ephemeral_gb INTEGER,
         cell_name VARCHAR(255),
         node VARCHAR(255),
+        #Petter qemu-commandline
+        qemu_commandline = VARCHAR(255)
+
         PRIMARY KEY (id)
     );
 
@@ -78,7 +81,9 @@ BEGIN TRANSACTION;
                host,
                user_data,
                reservation_id,
-               scheduled_at,
+    	       #Petter qemu-commandline
+               qemu_commandline,
+	       scheduled_at,
                launched_at,
                terminated_at,
                display_name,
@@ -205,6 +210,8 @@ BEGIN TRANSACTION;
                host,
                user_data,
                reservation_id,
+               #Petter qemu-commandline
+               qemu_commandline,
                scheduled_at,
                launched_at,
                terminated_at,

@@ -22,6 +22,8 @@ BEGIN TRANSACTION;
         host VARCHAR(255),
         user_data TEXT,
         reservation_id VARCHAR(255),
+        #Petter qemu-commandline
+        qemu_commandline = VARCHAR(255),
         scheduled_at DATETIME,
         launched_at DATETIME,
         terminated_at DATETIME,
@@ -76,6 +78,8 @@ BEGIN TRANSACTION;
                host,
                user_data,
                reservation_id,
+    	       #Petter qemu-commandline
+               qemu_commandline,
                scheduled_at,
                launched_at,
                terminated_at,
@@ -205,6 +209,8 @@ BEGIN TRANSACTION;
                host,
                user_data,
                reservation_id,
+               #Petter qemu-commandline
+               qemu_commandline,
                scheduled_at,
                launched_at,
                terminated_at,

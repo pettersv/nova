@@ -26,7 +26,6 @@ helpers for populating up config object instances.
 """
 
 from nova import exception
-from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
 
 from lxml import etree
@@ -41,9 +40,16 @@ class LibvirtConfigObject(object):
         super(LibvirtConfigObject, self).__init__()
 
         self.root_name = kwargs.get("root_name")
-        self.ns_prefix = kwargs.get('ns_prefix')
-        self.ns_uri = kwargs.get('ns_uri')
-
+        
+	#Petter use the qemu namespace if virt_type is qemu
+	#if (self.virt_type == "qemu"):
+	LOG.error('using the qemu namespace')
+	self.ns_uri = "http://libvirt.org/schemas/domain/qemu/1.0"
+	self.ns_prefix = "qemu" 
+	#else: 
+	#    self.ns_prefix = kwargs.get('ns_prefix')
+        #    self.ns_uri = kwargs.get('ns_uri')
+	
     def _text_node(self, name, value):
         child = etree.Element(name)
         child.text = str(value)
@@ -53,7 +59,12 @@ class LibvirtConfigObject(object):
         if self.ns_uri is None:
             return etree.Element(self.root_name)
         else:
-            return etree.Element("{" + self.ns_uri + "}" + self.root_name,
+	    #Petter needed here or the qemu: prefix is mapped to every node
+	    if (self.ns_prefix == "qemu"):
+	    	return etree.Element(self.root_name,
+                                 nsmap={self.ns_prefix: self.ns_uri})
+	    else:	
+            	return etree.Element("{" + self.ns_uri + "}" + self.root_name,
                                  nsmap={self.ns_prefix: self.ns_uri})
 
     def parse_str(self, xmlstr):
@@ -68,7 +79,7 @@ class LibvirtConfigObject(object):
     def to_xml(self, pretty_print=True):
         root = self.format_dom()
         xml_str = etree.tostring(root, pretty_print=pretty_print)
-        LOG.debug(_("Generated XML %s "), (xml_str,))
+        LOG.debug("Generated XML %s " % (xml_str,))
         return xml_str
 
 
@@ -1052,9 +1063,11 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.os_cmdline = None
         self.os_root = None
         self.os_init_path = None
-        self.os_boot_dev = []
+        self.os_boot_dev = None
         self.os_smbios = None
-        self.devices = []
+	#Petter qemu_commandline
+        self.qemu_commandline = []
+	self.devices = []
 
     def _format_basic_props(self, root):
         root.append(self._text_node("uuid", self.uuid))
@@ -1082,10 +1095,8 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             os.append(self._text_node("root", self.os_root))
         if self.os_init_path is not None:
             os.append(self._text_node("init", self.os_init_path))
-
-        for boot_dev in self.os_boot_dev:
-            os.append(etree.Element("boot", dev=boot_dev))
-
+        if self.os_boot_dev is not None:
+            os.append(etree.Element("boot", dev=self.os_boot_dev))
         if self.os_smbios is not None:
             os.append(self.os_smbios.format_dom())
         root.append(os)
@@ -1117,12 +1128,23 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         for dev in self.devices:
             devices.append(dev.format_dom())
         root.append(devices)
+ 
+    #Petter
+    def _format_qemu_commandline(self, root):
+        if len(self.qemu_commandline) == 0:
+            return
+        qemu_commandline = etree.Element("{"+self.ns_uri+"}commandline")
+	if (self.virt_type == 'qemu'):
+            for arg in self.qemu_commandline:
+	        argnode = etree.Element("{"+self.ns_uri+"}arg",value=arg)
+	        qemu_commandline.append(argnode)
+            root.append(qemu_commandline)
+	else:
+	    LOG.error('qemu_commandline parameters gicen but virt_type != qemu. Ignoring parameters')
 
     def format_dom(self):
         root = super(LibvirtConfigGuest, self).format_dom()
-
         root.set("type", self.virt_type)
-
         self._format_basic_props(root)
 
         if self.sysinfo is not None:
@@ -1139,7 +1161,9 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             root.append(self.cpu.format_dom())
 
         self._format_devices(root)
-
+	#Petter
+	self._format_qemu_commandline(root)
+	
         return root
 
     def parse_dom(self, xmldoc):

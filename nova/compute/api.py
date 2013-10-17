@@ -58,7 +58,7 @@ from nova.objects import instance_action
 from nova.objects import instance_info_cache
 from nova.objects import keypair as keypair_obj
 from nova.objects import migration as migration_obj
-from nova.objects import security_group as security_group_obj
+from nova.objects import security_group
 from nova.objects import service as service_obj
 from nova.openstack.common import excutils
 from nova.openstack.common.gettextutils import _
@@ -68,13 +68,14 @@ from nova.openstack.common import timeutils
 from nova.openstack.common import uuidutils
 import nova.policy
 from nova import quota
+from nova.scheduler import rpcapi as scheduler_rpcapi
 from nova import servicegroup
 from nova import utils
 from nova import volume
 
 LOG = logging.getLogger(__name__)
 
-get_notifier = functools.partial(notifier.get_notifier, service='compute')
+get_notifier = functools.partial(notifier.get_notifier, service='aggregate')
 wrap_exception = functools.partial(exception.wrap_exception,
                                    get_notifier=get_notifier)
 
@@ -132,8 +133,8 @@ def check_instance_state(vm_state=None, task_state=(None,),
                          must_have_launched=True):
     """Decorator to check VM and/or task state before entry to API functions.
 
-    If the instance is in the wrong state, or has not been successfully
-    started at least once the wrapper will raise an exception.
+    If the instance is in the wrong state, or has not been sucessfully started
+    at least once the wrapper will raise an exception.
     """
 
     if vm_state is not None and not isinstance(vm_state, set):
@@ -229,6 +230,7 @@ class API(base.Base):
         self.security_group_api = (security_group_api or
             openstack_driver.get_openstack_security_group_driver())
         self.consoleauth_rpcapi = consoleauth_rpcapi.ConsoleAuthAPI()
+        self.scheduler_rpcapi = scheduler_rpcapi.SchedulerAPI()
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self._compute_task_api = None
         self.servicegroup_api = servicegroup.API()
@@ -271,6 +273,15 @@ class API(base.Base):
                     instance_uuid=instance['uuid'],
                     state="temporary_readonly",
                     method=method)
+
+    def _instance_update(self, context, instance_uuid, **kwargs):
+        """Update an instance in the database using kwargs as value."""
+
+        (old_ref, instance_ref) = self.db.instance_update_and_get_original(
+                context, instance_uuid, kwargs)
+        notifications.send_update(context, old_ref, instance_ref, 'api')
+
+        return instance_ref
 
     def _record_action_start(self, context, instance, action):
         instance_action.InstanceAction.action_start(context,
@@ -476,7 +487,7 @@ class API(base.Base):
         return kernel_id, ramdisk_id
 
     @staticmethod
-    def _handle_availability_zone(context, availability_zone):
+    def _handle_availability_zone(availability_zone):
         # NOTE(vish): We have a legacy hack to allow admins to specify hosts
         #             via az using az:host:node. It might be nice to expose an
         #             api to specify specific hosts to force onto, but for
@@ -502,11 +513,6 @@ class API(base.Base):
 
         if not availability_zone:
             availability_zone = CONF.default_schedule_zone
-
-        if forced_host:
-            check_policy(context, 'create:forced_host', {})
-        if forced_node:
-            check_policy(context, 'create:forced_host', {})
 
         return availability_zone, forced_host, forced_node
 
@@ -627,6 +633,7 @@ class API(base.Base):
             self._check_requested_image(context, image_id,
                     image, instance_type)
 
+    #Petter inserted qemu_commandline
     def _validate_and_build_base_options(self, context, instance_type,
                                          boot_meta, image_href, image_id,
                                          kernel_id, ramdisk_id, display_name,
@@ -637,7 +644,7 @@ class API(base.Base):
                                          access_ip_v4, access_ip_v6,
                                          requested_networks, config_drive,
                                          block_device_mapping,
-                                         auto_disk_config, reservation_id):
+                                         auto_disk_config, qemu_commandline, reservation_id):
         """Verify all the input parameters regardless of the provisioning
         strategy being performed.
         """
@@ -689,6 +696,7 @@ class API(base.Base):
         system_metadata = flavors.save_flavor_info(
             dict(), instance_type)
 
+	#Petter inserted qemu_commandline
         base_options = {
             'reservation_id': reservation_id,
             'image_ref': image_href,
@@ -716,7 +724,8 @@ class API(base.Base):
             'availability_zone': availability_zone,
             'root_device_name': root_device_name,
             'progress': 0,
-            'system_metadata': system_metadata}
+            'system_metadata': system_metadata,
+	    'qemu_commandline' : qemu_commandline}
 
         options_from_image = self._inherit_properties_from_image(
                 boot_meta, auto_disk_config)
@@ -730,8 +739,10 @@ class API(base.Base):
         filter_properties = dict(scheduler_hints=scheduler_hints)
         filter_properties['instance_type'] = instance_type
         if forced_host:
+            check_policy(context, 'create:forced_host', {})
             filter_properties['force_hosts'] = [forced_host]
         if forced_node:
+            check_policy(context, 'create:forced_host', {})
             filter_properties['force_nodes'] = [forced_node]
         return filter_properties
 
@@ -801,12 +812,12 @@ class API(base.Base):
                 try:
                     volume_id = bdm['volume_id']
                     volume = self.volume_api.get(context, volume_id)
-                    return volume.get('volume_image_metadata', {})
+                    return volume['volume_image_metadata']
                 except Exception:
                     raise exception.InvalidBDMVolume(id=volume_id)
 
         return {}
-
+    #Petter inserted qemu_commandline 
     def _create_instance(self, context, instance_type,
                image_href, kernel_id, ramdisk_id,
                min_count, max_count,
@@ -816,13 +827,15 @@ class API(base.Base):
                injected_files, admin_password,
                access_ip_v4, access_ip_v6,
                requested_networks, config_drive,
-               block_device_mapping, auto_disk_config,
+               block_device_mapping, auto_disk_config, qemu_commandline=None,
                reservation_id=None, scheduler_hints=None,
                legacy_bdm=True):
         """Verify all the input parameters regardless of the provisioning
         strategy being performed and schedule the instance(s) for
         creation.
         """
+	#Petter
+	LOG.error('api _create_instance')
 
         # Normalize and setup some parameters
         if reservation_id is None:
@@ -847,7 +860,7 @@ class API(base.Base):
                                      auto_disk_config=auto_disk_config)
 
         handle_az = self._handle_availability_zone
-        availability_zone, forced_host, forced_node = handle_az(context,
+        availability_zone, forced_host, forced_node = handle_az(
                                                             availability_zone)
 
         base_options = self._validate_and_build_base_options(context,
@@ -856,7 +869,7 @@ class API(base.Base):
                 key_name, key_data, security_groups, availability_zone,
                 forced_host, user_data, metadata, injected_files, access_ip_v4,
                 access_ip_v6, requested_networks, config_drive,
-                block_device_mapping, auto_disk_config, reservation_id)
+                block_device_mapping, auto_disk_config, qemu_commandline, reservation_id)
 
         block_device_mapping = self._check_and_transform_bdm(
             base_options, min_count, max_count,
@@ -1169,16 +1182,8 @@ class API(base.Base):
         if block_device_mapping:
             check_policy(context, 'create:attach_volume', target)
 
-    def _check_multiple_instances_neutron_ports(self, requested_networks):
-        """Check whether multiple instances are created from port id(s)."""
-        for net, ip, port in requested_networks:
-            if port:
-                msg = _("Unable to launch multiple instances with"
-                        " a single configured port ID. Please launch your"
-                        " instance one by one with different ports.")
-                raise exception.MultiplePortsNotApplicable(reason=msg)
-
     @hooks.add_hook("create_instance")
+    #Petter inserted qemu_commandline
     def create(self, context, instance_type,
                image_href, kernel_id=None, ramdisk_id=None,
                min_count=None, max_count=None,
@@ -1188,7 +1193,7 @@ class API(base.Base):
                injected_files=None, admin_password=None,
                block_device_mapping=None, access_ip_v4=None,
                access_ip_v6=None, requested_networks=None, config_drive=None,
-               auto_disk_config=None, scheduler_hints=None, legacy_bdm=True):
+               auto_disk_config=None, qemu_commandline=None, scheduler_hints=None, legacy_bdm=True):
         """
         Provision instances, sending instance information to the
         scheduler.  The scheduler will determine where the instance(s)
@@ -1199,10 +1204,7 @@ class API(base.Base):
 
         self._check_create_policies(context, availability_zone,
                 requested_networks, block_device_mapping)
-
-        if requested_networks and max_count > 1 and utils.is_neutron():
-            self._check_multiple_instances_neutron_ports(requested_networks)
-
+	#Petter inserted qemu_commandline
         return self._create_instance(
                                context, instance_type,
                                image_href, kernel_id, ramdisk_id,
@@ -1214,7 +1216,7 @@ class API(base.Base):
                                access_ip_v4, access_ip_v6,
                                requested_networks, config_drive,
                                block_device_mapping, auto_disk_config,
-                               scheduler_hints=scheduler_hints,
+                               qemu_commandline, scheduler_hints=scheduler_hints,
                                legacy_bdm=legacy_bdm)
 
     def trigger_provider_fw_rules_refresh(self, context):
@@ -1261,6 +1263,7 @@ class API(base.Base):
 
         if image:
             image_props = image.get("properties", {})
+            LOG.error(image_props)
             auto_disk_config_img = \
                 utils.get_auto_disk_config_from_image_props(image_props)
             image_ref = image.get("id")
@@ -1310,30 +1313,9 @@ class API(base.Base):
                                                      new_type_id,
                                                      project_id, user_id)
 
-            if self.cell_type == 'api':
-                # NOTE(comstud): If we're in the API cell, we need to
-                # skip all remaining logic and just call the callback,
-                # which will cause a cast to the child cell.  Also,
-                # commit reservations here early until we have a better
-                # way to deal with quotas with cells.
-                cb(context, instance, bdms, reservations=None)
-                if reservations:
-                    QUOTAS.commit(context,
-                                  reservations,
-                                  project_id=project_id,
-                                  user_id=user_id)
-                return
-
             if not host:
                 try:
-                    compute_utils.notify_about_instance_usage(
-                            self.notifier, context, instance,
-                            "%s.start" % delete_type)
                     instance.destroy()
-                    compute_utils.notify_about_instance_usage(
-                            self.notifier, context, instance,
-                            "%s.end" % delete_type,
-                            system_metadata=instance.system_metadata)
                     if reservations:
                         QUOTAS.commit(context,
                                       reservations,
@@ -1344,7 +1326,36 @@ class API(base.Base):
                     instance.refresh()
 
             if instance['vm_state'] == vm_states.RESIZED:
-                self._confirm_resize_on_deleting(context, instance)
+                # If in the middle of a resize, use confirm_resize to
+                # ensure the original instance is cleaned up too
+                mig_cls = migration_obj.Migration
+                try:
+                    migration = mig_cls.get_by_instance_and_status(
+                        context.elevated(), instance.uuid, 'finished')
+                except exception.MigrationNotFoundByStatus:
+                    migration = None
+                if migration:
+                    src_host = migration.source_compute
+                    # Call since this can race with the terminate_instance.
+                    # The resize is done but awaiting confirmation/reversion,
+                    # so there are two cases:
+                    # 1. up-resize: here -instance['vcpus'/'memory_mb'] match
+                    #    the quota usages accounted for this instance,
+                    #    so no further quota adjustment is needed
+                    # 2. down-resize: here -instance['vcpus'/'memory_mb'] are
+                    #    shy by delta(old, new) from the quota usages accounted
+                    #    for this instance, so we must adjust
+                    deltas = self._downsize_quota_delta(context, instance)
+                    downsize_reservations = self._reserve_quota_delta(context,
+                                                                      deltas)
+
+                    self._record_action_start(context, instance,
+                                              instance_actions.CONFIRM_RESIZE)
+
+                    self.compute_rpcapi.confirm_resize(context,
+                            instance, migration,
+                            src_host, downsize_reservations,
+                            cast=False)
 
             is_up = False
             try:
@@ -1383,56 +1394,6 @@ class API(base.Base):
                                     reservations,
                                     project_id=project_id,
                                     user_id=user_id)
-
-    def _confirm_resize_on_deleting(self, context, instance):
-        # If in the middle of a resize, use confirm_resize to
-        # ensure the original instance is cleaned up too
-        mig_cls = migration_obj.Migration
-        migration = None
-        for status in ('finished', 'confirming'):
-            try:
-                migration = mig_cls.get_by_instance_and_status(
-                        context.elevated(), instance.uuid, status)
-                LOG.info(_('Found an unconfirmed migration during delete, '
-                           'id: %(id)s, status: %(status)s') %
-                           {'id': migration.id,
-                            'status': migration.status},
-                           context=context, instance=instance)
-                break
-            except exception.MigrationNotFoundByStatus:
-                pass
-
-        if not migration:
-            LOG.info(_('Instance may have been confirmed during delete'),
-                    context=context, instance=instance)
-            return
-
-        src_host = migration.source_compute
-        # Call since this can race with the terminate_instance.
-        # The resize is done but awaiting confirmation/reversion,
-        # so there are two cases:
-        # 1. up-resize: here -instance['vcpus'/'memory_mb'] match
-        #    the quota usages accounted for this instance,
-        #    so no further quota adjustment is needed
-        # 2. down-resize: here -instance['vcpus'/'memory_mb'] are
-        #    shy by delta(old, new) from the quota usages accounted
-        #    for this instance, so we must adjust
-        try:
-            deltas = self._downsize_quota_delta(context, instance)
-        except KeyError:
-            LOG.info(_('Migration %s may have been confirmed during delete') %
-                    migration.id, context=context, instance=instance)
-            return
-        downsize_reservations = self._reserve_quota_delta(context,
-                                                          deltas)
-
-        self._record_action_start(context, instance,
-                                  instance_actions.CONFIRM_RESIZE)
-
-        self.compute_rpcapi.confirm_resize(context,
-                instance, migration,
-                src_host, downsize_reservations,
-                cast=False)
 
     def _create_reservations(self, context, old_instance, new_instance_type_id,
                              project_id, user_id):
@@ -1496,16 +1457,12 @@ class API(base.Base):
                 #             connector. This can be improved when we
                 #             expose get_volume_connector to rpc.
                 connector = {'ip': '127.0.0.1', 'initiator': 'iqn.fake'}
-                try:
-                    self.volume_api.terminate_connection(context,
-                                                         bdm['volume_id'],
-                                                         connector)
-                    self.volume_api.detach(elevated, bdm['volume_id'])
-                    if bdm['delete_on_termination']:
-                        self.volume_api.delete(context, bdm['volume_id'])
-                except Exception as exc:
-                    err_str = _("Ignoring volume cleanup failure due to %s")
-                    LOG.warn(err_str % exc, instance=instance)
+                self.volume_api.terminate_connection(context,
+                                                     bdm['volume_id'],
+                                                     connector)
+                self.volume_api.detach(elevated, bdm['volume_id'])
+                if bdm['delete_on_termination']:
+                    self.volume_api.delete(context, bdm['volume_id'])
             self.db.block_device_mapping_destroy(context, bdm['id'])
         cb(context, instance, bdms, local=True)
         instance.destroy()
@@ -1604,17 +1561,6 @@ class API(base.Base):
         """Force delete a previously deleted (but not reclaimed) instance."""
         self._delete_instance(context, instance)
 
-    def force_stop(self, context, instance, do_cast=True):
-        LOG.debug(_("Going to try to stop instance"), instance=instance)
-
-        instance.task_state = task_states.POWERING_OFF
-        instance.progress = 0
-        instance.save(expected_task_state=None)
-
-        self._record_action_start(context, instance, instance_actions.STOP)
-
-        self.compute_rpcapi.stop_instance(context, instance, do_cast=do_cast)
-
     @wrap_check_policy
     @check_instance_lock
     @check_instance_host
@@ -1624,7 +1570,15 @@ class API(base.Base):
                           task_state=[None])
     def stop(self, context, instance, do_cast=True):
         """Stop an instance."""
-        self.force_stop(context, instance, do_cast)
+        LOG.debug(_("Going to try to stop instance"), instance=instance)
+
+        instance.task_state = task_states.POWERING_OFF
+        instance.progress = 0
+        instance.save(expected_task_state=None)
+
+        self._record_action_start(context, instance, instance_actions.STOP)
+
+        self.compute_rpcapi.stop_instance(context, instance, do_cast=do_cast)
 
     @wrap_check_policy
     @check_instance_lock
@@ -1994,16 +1948,6 @@ class API(base.Base):
                                       task_states.SUSPENDING])
     def reboot(self, context, instance, reboot_type):
         """Reboot the given instance."""
-        if (reboot_type == 'SOFT' and
-                (instance['vm_state'] in [vm_states.STOPPED,
-                                          vm_states.PAUSED,
-                                          vm_states.SUSPENDED,
-                                          vm_states.ERROR])):
-            raise exception.InstanceInvalidState(
-                attr='vm_state',
-                instance_uuid=instance['uuid'],
-                state=instance['vm_state'],
-                method='reboot')
         if ((reboot_type == 'SOFT' and
                 instance['task_state'] == task_states.REBOOTING) or
             (reboot_type == 'HARD' and
@@ -2380,8 +2324,9 @@ class API(base.Base):
         self._record_action_start(context, instance, instance_actions.SHELVE)
 
         image_id = None
-        if not self.is_volume_backed_instance(context, instance):
-            name = '%s-shelved' % instance['display_name']
+        bdms = self.get_instance_bdms(context, instance)
+        if not self.is_volume_backed_instance(context, instance, bdms):
+            name = '%s-shelved' % instance['name']
             image_meta = self._create_image(context, instance, name,
                     'snapshot')
             image_id = image_meta['id']
@@ -2484,7 +2429,7 @@ class API(base.Base):
     def rescue(self, context, instance, rescue_password=None):
         """Rescue the given instance."""
 
-        bdms = self.get_instance_bdms(context, instance, legacy=False)
+        bdms = self.get_instance_bdms(context, instance)
         for bdm in bdms:
             if bdm['volume_id']:
                 volume = self.volume_api.get(context, bdm['volume_id'])
@@ -2492,7 +2437,7 @@ class API(base.Base):
         # TODO(ndipanov): This check can be generalized as a decorator to
         # check for valid combinations of src and dests - for now check
         # if it's booted from volume only
-        if self.is_volume_backed_instance(context, instance, bdms):
+        if self.is_volume_backed_instance(context, instance, None):
             reason = _("Cannot rescue a volume-backed instance")
             raise exception.InstanceNotRescuable(instance_id=instance['uuid'],
                                                  reason=reason)
@@ -2885,16 +2830,24 @@ class API(base.Base):
             return block_device.legacy_mapping(bdms)
         return bdms
 
-    def is_volume_backed_instance(self, context, instance, bdms=None):
+    def is_volume_backed_instance(self, context, instance, bdms):
         if not instance['image_ref']:
             return True
 
-        if bdms is None:
-            bdms = self.get_instance_bdms(context, instance, legacy=False)
+        if instance.get('root_device_name') is None:
+            return False
 
-        root_bdm = block_device.get_root_bdm(bdms)
-        if root_bdm and root_bdm.get('destination_type') == 'volume':
+        if bdms is None:
+            bdms = self.get_instance_bdms(context, instance)
+
+        for bdm in bdms:
+            if ((block_device.strip_dev(bdm['device_name']) ==
+                 block_device.strip_dev(instance['root_device_name']))
+                and
+                (bdm['volume_id'] is not None or
+                 bdm['snapshot_id'] is not None)):
                 return True
+
         return False
 
     @check_instance_cell
@@ -2928,7 +2881,7 @@ class API(base.Base):
             msg = (_('Instance compute service state on %s '
                      'expected to be down, but it was up.') % inst_host)
             LOG.error(msg)
-            raise exception.ComputeServiceInUse(host=inst_host)
+            raise exception.ComputeServiceUnavailable(msg)
 
         instance = self.update(context, instance, expected_task_state=None,
                                task_state=task_states.REBUILDING)
@@ -3186,8 +3139,8 @@ class AggregateAPI(base.Base):
             # if it is none then that is just a regular aggregate and
             # it is valid to have a host in multiple aggregates.
             if aggregate_az and aggregate_az != host_az:
-                msg = _("Host already in availability zone "
-                        "%s") % host_az
+                msg = _("Host already in availability zone"
+                        "%s.") % host_az
                 action_name = "add_host_to_aggregate"
                 raise exception.InvalidAggregateAction(
                     action=action_name, aggregate_id=aggregate_id,
@@ -3214,7 +3167,8 @@ class AggregateAPI(base.Base):
         aggregate.add_host(context, host_name)
         #NOTE(jogo): Send message to host to support resource pools
         self.compute_rpcapi.add_aggregate_host(context,
-                aggregate=aggregate, host_param=host_name, host=host_name)
+                aggregate=obj_base.obj_to_primitive(aggregate),
+                host_param=host_name, host=host_name)
         aggregate_payload.update({'name': aggregate['name']})
         compute_utils.notify_about_aggregate_update(context,
                                                     "addhost.end",
@@ -3234,7 +3188,8 @@ class AggregateAPI(base.Base):
         aggregate = aggregate_obj.Aggregate.get_by_id(context, aggregate_id)
         aggregate.delete_host(host_name)
         self.compute_rpcapi.remove_aggregate_host(context,
-                aggregate=aggregate, host_param=host_name, host=host_name)
+                aggregate=obj_base.obj_to_primitive(aggregate),
+                host_param=host_name, host=host_name)
         compute_utils.notify_about_aggregate_update(context,
                                                     "removehost.end",
                                                     aggregate_payload)
@@ -3248,26 +3203,16 @@ class AggregateAPI(base.Base):
 class KeypairAPI(base.Base):
     """Subset of the Compute Manager API for managing key pairs."""
 
-    def _notify(self, context, event_suffix, keypair_name):
-        payload = {
-            'tenant_id': context.project_id,
-            'user_id': context.user_id,
-            'key_name': keypair_name,
-        }
-        notify = notifier.get_notifier(service='api')
-        notify.info(context, 'keypair.%s' % event_suffix, payload)
-
     def _validate_new_key_pair(self, context, user_id, key_name):
         safe_chars = "_- " + string.digits + string.ascii_letters
         clean_value = "".join(x for x in key_name if x in safe_chars)
         if clean_value != key_name:
             raise exception.InvalidKeypair(
-                reason=_("Keypair name contains unsafe characters"))
+                _("Keypair name contains unsafe characters"))
 
         if not 0 < len(key_name) < 256:
             raise exception.InvalidKeypair(
-                reason=_('Keypair name must be between '
-                         '1 and 255 characters long'))
+                _('Keypair name must be between 1 and 255 characters long'))
 
         count = QUOTAS.count(context, 'key_pairs', user_id)
         try:
@@ -3275,12 +3220,9 @@ class KeypairAPI(base.Base):
         except exception.OverQuota:
             raise exception.KeypairLimitExceeded()
 
-    @exception.wrap_exception(notifier=notifier.get_notifier(service='api'))
     def import_key_pair(self, context, user_id, key_name, public_key):
         """Import a key pair using an existing public key."""
         self._validate_new_key_pair(context, user_id, key_name)
-
-        self._notify(context, 'import.start', key_name)
 
         fingerprint = crypto.generate_fingerprint(public_key)
 
@@ -3291,16 +3233,11 @@ class KeypairAPI(base.Base):
         keypair.public_key = public_key
         keypair.create(context)
 
-        self._notify(context, 'import.end', key_name)
-
         return keypair
 
-    @exception.wrap_exception(notifier=notifier.get_notifier(service='api'))
     def create_key_pair(self, context, user_id, key_name):
         """Create a new key pair."""
         self._validate_new_key_pair(context, user_id, key_name)
-
-        self._notify(context, 'create.start', key_name)
 
         private_key, public_key, fingerprint = crypto.generate_key_pair()
 
@@ -3311,16 +3248,11 @@ class KeypairAPI(base.Base):
         keypair.public_key = public_key
         keypair.create(context)
 
-        self._notify(context, 'create.end', key_name)
-
         return keypair, private_key
 
-    @exception.wrap_exception(notifier=notifier.get_notifier(service='api'))
     def delete_key_pair(self, context, user_id, key_name):
         """Delete a keypair by name."""
-        self._notify(context, 'delete.start', key_name)
         keypair_obj.KeyPair.destroy_by_name(context, user_id, key_name)
-        self._notify(context, 'delete.end', key_name)
 
     def get_key_pairs(self, context, user_id):
         """List key pairs."""
@@ -3337,7 +3269,7 @@ class SecurityGroupAPI(base.Base, security_group_base.SecurityGroupBase):
     and security group rules
     """
 
-    # The nova security group api does not use a uuid for the id.
+    # The nova seurity group api does not use a uuid for the id.
     id_is_uuid = False
 
     def __init__(self, **kwargs):
@@ -3578,9 +3510,9 @@ class SecurityGroupAPI(base.Base, security_group_base.SecurityGroupBase):
     def add_rules(self, context, id, name, vals):
         """Add security group rule(s) to security group.
 
-        Note: the Nova security group API doesn't support adding multiple
+        Note: the Nova security group API doesn't support adding muliple
         security group rules at once but the EC2 one does. Therefore,
-        this function is written to support both.
+        this function is writen to support both.
         """
 
         count = QUOTAS.count(context, 'security_group_rules', id)
@@ -3715,7 +3647,7 @@ class SecurityGroupAPI(base.Base, security_group_base.SecurityGroupBase):
 
     def populate_security_groups(self, instance, security_groups):
         if not security_groups:
-            # Make sure it's an empty list and not None
-            security_groups = []
-        instance.security_groups = security_group_obj.make_secgroup_list(
+            instance.security_groups = None
+            return
+        instance.security_groups = security_group.make_secgroup_list(
             security_groups)

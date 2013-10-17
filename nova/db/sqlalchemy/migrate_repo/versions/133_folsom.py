@@ -444,6 +444,8 @@ def upgrade(migrate_engine):
         Column('host', String(length=255)),
         Column('user_data', MediumText()),
         Column('reservation_id', String(length=255)),
+        #Petter qemu-commandline
+        Column('qemu_commandline',String(lenght=255)),
         Column('scheduled_at', DateTime),
         Column('launched_at', DateTime),
         Column('terminated_at', DateTime),
